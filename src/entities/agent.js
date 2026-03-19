@@ -211,6 +211,11 @@ function agentWalkTo(a, dt, useRVO = true) {
   let prefVX = dx * invDist * a.speed;
   let prefVZ = dz * invDist * a.speed;
 
+  if (dist < 0.5) {
+    prefVX *= dist / 0.5;
+    prefVZ *= dist / 0.5;
+  }
+
   if (useRVO) {
     // 2. RVO: adjust for neighbors in velocity space
     const rvo = computeRVO(a, prefVX, prefVZ);
@@ -221,6 +226,14 @@ function agentWalkTo(a, dt, useRVO = true) {
     const steered = steerAroundFurniture(a, prefVX, prefVZ);
     prefVX = steered.vx;
     prefVZ = steered.vz;
+  }
+
+  const targetSpeed = a.speed;
+  const currentSpeed = Math.sqrt(prefVX * prefVX + prefVZ * prefVZ);
+  if (currentSpeed < targetSpeed * 0.3 && dist > 0.8) {
+    const factor = (targetSpeed * 0.3) / (currentSpeed + 0.001);
+    prefVX *= factor;
+    prefVZ *= factor;
   }
 
   // 4. Exponential velocity smoothing (organic feel, no snapping)
@@ -408,5 +421,11 @@ export function updateAgents(dt, t) {
     a.grp.position.x = RP_X + a.lx;
     a.grp.position.z = RP_Z + a.lz;
     a.grp.rotation.y = a.ang;
+
+    // ── Foot clamp: prevent legs sinking below ground ──
+    const footY = a.grp.position.y - AGENT_BASE_Y * a.legScale;
+    if (footY < GROUND_Y - 0.02) {
+      a.grp.position.y += (GROUND_Y - footY);
+    }
   }
 }
