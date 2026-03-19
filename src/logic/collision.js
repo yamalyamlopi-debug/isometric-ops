@@ -223,6 +223,12 @@ export function steerAroundFurniture(a, vx, vz) {
 
     if (penX <= 0 || penZ <= 0) continue;
 
+    if (penX > 0.1 || penZ > 0.1) {
+      vx = 0;
+      vz = 0;
+      return { vx, vz };
+    }
+
     const sgnX = dx >= 0 ? 1 : -1;
     const sgnZ = dz >= 0 ? 1 : -1;
 
