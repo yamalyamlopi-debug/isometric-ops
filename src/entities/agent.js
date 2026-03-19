@@ -3,16 +3,20 @@
  * @module entities/agent
  * @description Autonomous worker agents for Isometric Ops.
  *
- * Exports:
- *   buildAgent(palIdx)                    — build and return mesh parts
- *   spawnAgent(startX, startZ, palIdx, speed) — create, add to scene, register in globalState
- *   updateAgents(dt, t)                   — per-frame state machine for all agents
+ * Changes from v1 (separation forces) to v2 (RVO + steering):
+ *   · AgentRecord gains vx / vz (smooth integrated velocity) and stuckTimer.
+ *   · agentWalkTo() now runs the full velocity pipeline:
+ *       preferred → computeRVO → steerAroundFurniture → smooth integration → move
+ *   · 'waiting' state added: agents stuck in congestion stop briefly and
+ *       re-pick a clear target instead of perpetually fighting the crowd.
+ *   · Leg animation scales with actual speed (no phantom walking when stuck).
+ *   · Facing direction tracks the real velocity vector, not just target direction.
  */
 
 'use strict';
 
-import { scene }                           from '../core/scene.js';
-import { globalState }                     from '../core/state.js';
+import { scene }    from '../core/scene.js';
+import { globalState } from '../core/state.js';
 import {
   RP_X, RP_Z,
   GROUND_Y,
@@ -24,10 +28,20 @@ import {
   AGENT_BASE_Y,
   CHAIR_SEAT_H,
 } from '../core/state.js';
-import { applySeparation, isInFurniture, randSafePt } from '../logic/collision.js';
+import { computeRVO, steerAroundFurniture, isInFurniture, randSafePt } from '../logic/collision.js';
 
 // ─────────────────────────────────────────────────────────────
-// COLOUR PALETTE (5 entries, cycles via palIdx % 5)
+// TUNING
+// ─────────────────────────────────────────────────────────────
+
+const STUCK_SPEED_RATIO = 0.08; // fraction of target speed below which "stuck" accumulates
+const STUCK_TIMEOUT     = 2.4;  // seconds before stuck agent enters 'waiting'
+const WAIT_MIN          = 0.35;
+const WAIT_MAX          = 0.75;
+const VEL_SMOOTH        = 8.0;  // velocity smoothing rate (higher = snappier)
+
+// ─────────────────────────────────────────────────────────────
+// COLOUR PALETTE
 // ─────────────────────────────────────────────────────────────
 
 const PALETTE = [
@@ -42,13 +56,6 @@ const PALETTE = [
 // MATH HELPER
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Lerps angle `a` toward `b` by factor `t`, taking the shortest arc.
- * @param {number} a - Current angle (radians)
- * @param {number} b - Target angle (radians)
- * @param {number} t - Lerp factor [0–1]
- * @returns {number}
- */
 function lerpAngle(a, b, t) {
   let d = b - a;
   while (d >  Math.PI) d -= Math.PI * 2;
@@ -57,85 +64,59 @@ function lerpAngle(a, b, t) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// MESH FACTORY
+// MESH FACTORY  (unchanged from v1)
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Builds and returns the Three.js mesh parts for one agent.
- * Group origin = hip (local y=0), feet reach local y = -AGENT_BASE_Y.
- *
- * @param {number} palIdx - Palette index (wraps with modulo)
- * @returns {{ grp: THREE.Group, torso, head, legL, legR, botCap }}
+ * Builds and returns Three.js mesh parts for one agent.
+ * Group origin = hip (local y=0), feet = y = -AGENT_BASE_Y.
+ * @param {number} palIdx
+ * @returns {{ grp, torso, head, legL, legR, botCap }}
  */
 export function buildAgent(palIdx) {
-  const pal      = PALETTE[palIdx % PALETTE.length];
-  const bodyMat  = new THREE.MeshStandardMaterial({ color: pal.body, roughness: 0.6,  metalness: 0.05 });
-  const accMat   = new THREE.MeshStandardMaterial({ color: pal.acc,  roughness: 0.55, metalness: 0.05 });
-  const skinMat  = new THREE.MeshStandardMaterial({ color: pal.skin, roughness: 0.7 });
+  const pal     = PALETTE[palIdx % PALETTE.length];
+  const bodyMat = new THREE.MeshStandardMaterial({ color: pal.body, roughness: 0.6,  metalness: 0.05 });
+  const accMat  = new THREE.MeshStandardMaterial({ color: pal.acc,  roughness: 0.55, metalness: 0.05 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: pal.skin, roughness: 0.7 });
+  const grp     = new THREE.Group();
+  const bR      = 0.2;
+  const bH      = 0.6;
 
-  const grp   = new THREE.Group();
-  const bR    = 0.2;
-  const bH    = 0.6;
-
-  // torso (hip = y=0, top = y=bH)
   const torso = new THREE.Mesh(new THREE.CylinderGeometry(bR, bR * 0.92, bH, 12), bodyMat);
-  torso.position.set(0, bH / 2, 0);
-  torso.castShadow = true;
-  grp.add(torso);
+  torso.position.set(0, bH / 2, 0); torso.castShadow = true; grp.add(torso);
 
-  // rounded shoulder cap
   const topCap = new THREE.Mesh(
-    new THREE.SphereGeometry(bR, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2),
-    bodyMat
-  );
-  topCap.position.set(0, bH, 0);
-  grp.add(topCap);
+    new THREE.SphereGeometry(bR, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2), bodyMat);
+  topCap.position.set(0, bH, 0); grp.add(topCap);
 
-  // rounded hip cap (hidden when seated)
   const botCap = new THREE.Mesh(
-    new THREE.SphereGeometry(bR * 0.92, 12, 8, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2),
-    bodyMat
-  );
-  botCap.position.set(0, 0, 0);
-  grp.add(botCap);
+    new THREE.SphereGeometry(bR * 0.92, 12, 8, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2), bodyMat);
+  botCap.position.set(0, 0, 0); grp.add(botCap);
 
-  // head
   const hR   = 0.16;
   const head = new THREE.Mesh(new THREE.SphereGeometry(hR, 14, 10), skinMat);
-  head.position.set(0, bH + hR + 0.05, 0);
-  head.castShadow = true;
-  grp.add(head);
+  head.position.set(0, bH + hR + 0.05, 0); head.castShadow = true; grp.add(head);
 
-  // hair (upper hemisphere)
   const hair = new THREE.Mesh(
-    new THREE.SphereGeometry(hR * 1.08, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2),
-    accMat
-  );
-  hair.position.set(0, head.position.y + 0.02, 0);
-  grp.add(hair);
+    new THREE.SphereGeometry(hR * 1.08, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2), accMat);
+  hair.position.set(0, head.position.y + 0.02, 0); grp.add(hair);
 
-  // legs — geometry translated so pivot is at hip (local y=0), feet at y=-AGENT_LEG_H
   const legGeoL = new THREE.CylinderGeometry(AGENT_LEG_TOP_R, AGENT_LEG_BOT_R, AGENT_LEG_H, 8);
   legGeoL.translate(0, -AGENT_LEG_H / 2, 0);
   const legL = new THREE.Mesh(legGeoL, accMat);
-  legL.position.set(-0.075, 0, 0);
-  legL.castShadow = true;
-  grp.add(legL);
+  legL.position.set(-0.075, 0, 0); legL.castShadow = true; grp.add(legL);
 
   const legGeoR = new THREE.CylinderGeometry(AGENT_LEG_TOP_R, AGENT_LEG_BOT_R, AGENT_LEG_H, 8);
   legGeoR.translate(0, -AGENT_LEG_H / 2, 0);
   const legR = new THREE.Mesh(legGeoR, accMat);
-  legR.position.set(0.075, 0, 0);
-  legR.castShadow = true;
-  grp.add(legR);
+  legR.position.set(0.075, 0, 0); legR.castShadow = true; grp.add(legR);
 
-  // ground shadow disc — in local space, floor = -AGENT_BASE_Y (computed after init)
   const shad = new THREE.Mesh(
     new THREE.CircleGeometry(0.22, 16),
     new THREE.MeshBasicMaterial({ color: 0x0a0810, transparent: true, opacity: 0.15, depthWrite: false })
   );
   shad.rotation.x = -Math.PI / 2;
-  shad.position.set(0, -AGENT_BASE_Y + 0.002, 0); // AGENT_BASE_Y set after initGroundConstants()
+  shad.position.set(0, -AGENT_BASE_Y + 0.002, 0);
   grp.add(shad);
 
   return { grp, torso, head, legL, legR, botCap };
@@ -146,13 +127,9 @@ export function buildAgent(palIdx) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Creates one agent, places it in the scene, and pushes an AgentRecord
- * into globalState.agents[].
- *
- * @param {number} startX - Initial room-local X
- * @param {number} startZ - Initial room-local Z
- * @param {number} palIdx - Palette colour index
- * @param {number} speed  - Walk speed in units/second
+ * Creates one agent, adds it to the scene, and registers it in globalState.agents[].
+ * New fields: vx/vz (smooth velocity), stuckTimer.
+ * @param {number} startX @param {number} startZ @param {number} palIdx @param {number} speed
  */
 export function spawnAgent(startX, startZ, palIdx, speed) {
   const mesh = buildAgent(palIdx);
@@ -162,22 +139,26 @@ export function spawnAgent(startX, startZ, palIdx, speed) {
   const wp = randSafePt();
   globalState.agents.push({
     mesh,
-    grp:      mesh.grp,
+    grp:        mesh.grp,
     speed,
-    state:    'walk',
-    lx:       startX,
-    lz:       startZ,
-    tx:       wp.x,
-    tz:       wp.z,
-    ang:      0,
-    tAng:     Math.atan2(wp.x - startX, wp.z - startZ),
-    timer:    0,
-    phase:    Math.random() * Math.PI * 2,
-    desk:     null,
-    sitOff:   0,
-    sitTgt:   0,
-    wkChance: 0.5,
-    legScale: 1.0,
+    state:      'walk',
+    lx:         startX,
+    lz:         startZ,
+    tx:         wp.x,
+    tz:         wp.z,
+    ang:        0,
+    tAng:       Math.atan2(wp.x - startX, wp.z - startZ),
+    timer:      0,
+    phase:      Math.random() * Math.PI * 2,
+    desk:       null,
+    sitOff:     0,
+    sitTgt:     0,
+    wkChance:   0.5,
+    legScale:   1.0,
+    // ── NEW v2 fields ──
+    vx:         0,          // current velocity X (smooth)
+    vz:         0,          // current velocity Z (smooth)
+    stuckTimer: 0,          // seconds agent has been nearly stationary
   });
 }
 
@@ -185,17 +166,16 @@ export function spawnAgent(startX, startZ, palIdx, speed) {
 // INTERNAL HELPERS
 // ─────────────────────────────────────────────────────────────
 
-/** @param {import('../core/state.js').AgentRecord} a */
 function agentPickWander(a) {
-  const wp = randSafePt();
-  a.tx    = wp.x;
-  a.tz    = wp.z;
-  a.tAng  = Math.atan2(wp.x - a.lx, wp.z - a.lz);
-  a.sitTgt = 0;
-  a.state  = 'walk';
+  const wp   = randSafePt();
+  a.tx       = wp.x;
+  a.tz       = wp.z;
+  a.tAng     = Math.atan2(wp.x - a.lx, wp.z - a.lz);
+  a.sitTgt   = 0;
+  a.state    = 'walk';
+  a.stuckTimer = 0;
 }
 
-/** Returns the first un-reserved desk, or null if all are taken. */
 function findFreeDesk() {
   const { desks } = globalState;
   for (let i = 0; i < desks.length; i++) {
@@ -205,62 +185,70 @@ function findFreeDesk() {
 }
 
 /**
- * Moves agent toward (a.tx, a.tz).  Returns true when arrived.
- * Animates leg swing and clamps position to room bounds.
+ * Moves agent toward (a.tx, a.tz) using the full RVO velocity pipeline.
+ * Returns true when arrived (dist < 0.15).
+ *
+ * Pipeline:
+ *   preferred velocity → computeRVO → steerAroundFurniture
+ *   → exponential smooth integration → position update → wall clamp
+ *
+ * Also updates a.vx/vz (for neighbors to read), a.tAng (from real velocity),
+ * and animates legs scaled to actual speed.
  *
  * @param {import('../core/state.js').AgentRecord} a
  * @param {number} dt
+ * @param {boolean} [useRVO=true] - set false for toDesk final approach
  * @returns {boolean}
  */
-function agentWalkTo(a, dt) {
+function agentWalkTo(a, dt, useRVO = true) {
   const dx   = a.tx - a.lx;
   const dz   = a.tz - a.lz;
   const dist = Math.sqrt(dx * dx + dz * dz);
   if (dist < 0.15) return true;
 
-  const step = Math.min(a.speed * dt / dist, 1);
-  a.lx += dx * step;
-  a.lz += dz * step;
+  // 1. Preferred velocity: full speed toward target
+  const invDist = 1 / dist;
+  let prefVX = dx * invDist * a.speed;
+  let prefVZ = dz * invDist * a.speed;
 
-  // wall bounds
+  if (useRVO) {
+    // 2. RVO: adjust for neighbors in velocity space
+    const rvo = computeRVO(a, prefVX, prefVZ);
+    prefVX = rvo.vx;
+    prefVZ = rvo.vz;
+
+    // 3. Furniture steering: tangential slide around desks
+    const steered = steerAroundFurniture(a, prefVX, prefVZ);
+    prefVX = steered.vx;
+    prefVZ = steered.vz;
+  }
+
+  // 4. Exponential velocity smoothing (organic feel, no snapping)
+  const smooth = 1 - Math.exp(-VEL_SMOOTH * dt);
+  a.vx += (prefVX - a.vx) * smooth;
+  a.vz += (prefVZ - a.vz) * smooth;
+
+  // 5. Integrate position
+  a.lx += a.vx * dt;
+  a.lz += a.vz * dt;
+
+  // 6. Wall clamp
   a.lx = Math.max(BOUNDS.minX + AGENT_RADIUS, Math.min(BOUNDS.maxX - AGENT_RADIUS, a.lx));
   a.lz = Math.max(BOUNDS.minZ + AGENT_RADIUS, Math.min(BOUNDS.maxZ - AGENT_RADIUS, a.lz));
 
-  // face direction of travel
-  if (dist > 0.15) a.tAng = Math.atan2(dx, dz);
-
-  // leg swing animation
-  a.phase += dt * 9;
-  a.mesh.legL.rotation.x =  Math.sin(a.phase) * 0.4;
-  a.mesh.legR.rotation.x = -Math.sin(a.phase) * 0.4;
-  return false;
-}
-
-/**
- * Pushes agent out of furniture obstacles during 'walk' state only.
- * Skips 'toDesk' and 'work' states to avoid jitter when seated.
- *
- * @param {import('../core/state.js').AgentRecord} a
- * @param {number} dt
- */
-function avoidFurniture(a, dt) {
-  if (a.state === 'work' || a.state === 'toDesk') return;
-  const { desks } = globalState;
-  const { AGENT_RADIUS: AR, FURNITURE_MARGIN: FM } = { AGENT_RADIUS, FURNITURE_MARGIN: 0.15 };
-  for (let i = 0; i < desks.length; i++) {
-    const d    = desks[i];
-    const dx   = a.lx - d.obsX;
-    const dz   = a.lz - d.obsZ;
-    const penX = d.obsRadX + AGENT_RADIUS + 0.15 - Math.abs(dx);
-    const penZ = d.obsRadZ + AGENT_RADIUS + 0.15 - Math.abs(dz);
-    if (penX > 0 && penZ > 0) {
-      if (penX < penZ) {
-        a.lx += (dx > 0 ? penX : -penX) * dt * 5;
-      } else {
-        a.lz += (dz > 0 ? penZ : -penZ) * dt * 5;
-      }
-    }
+  // 7. Facing: track actual velocity direction (not just target direction)
+  const actualSpd = Math.sqrt(a.vx * a.vx + a.vz * a.vz);
+  if (actualSpd > 0.05) {
+    a.tAng = Math.atan2(a.vx, a.vz);
   }
+
+  // 8. Leg animation scaled to actual speed
+  const speedRatio = Math.min(actualSpd / a.speed, 1.0);
+  a.phase += dt * 9 * Math.max(speedRatio, 0.1);
+  a.mesh.legL.rotation.x =  Math.sin(a.phase) * 0.4 * speedRatio;
+  a.mesh.legR.rotation.x = -Math.sin(a.phase) * 0.4 * speedRatio;
+
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -268,28 +256,47 @@ function avoidFurniture(a, dt) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Runs the per-frame state machine for every agent in globalState.agents[].
- * Called once per animation frame from main.js.
+ * Per-frame state machine for all agents.
+ * States: walk | pause | toDesk | work | waiting
  *
- * @param {number} dt - Frame delta-time in seconds
- * @param {number} t  - Total elapsed time in seconds
+ * @param {number} dt
+ * @param {number} t
  */
 export function updateAgents(dt, t) {
   const { agents } = globalState;
 
   for (let i = 0; i < agents.length; i++) {
     const a  = agents[i];
-    const rs = 1 - Math.exp(-10 * dt); // rotation lerp factor
+    const rs = 1 - Math.exp(-10 * dt);
 
     // ── STATE MACHINE ──────────────────────────────────────────────
 
     if (a.state === 'walk') {
+      const prevLx = a.lx;
+      const prevLz = a.lz;
+
       if (agentWalkTo(a, dt)) {
-        a.state = 'pause';
-        a.timer = 1.5 + Math.random() * 2.5;
+        a.state      = 'pause';
+        a.timer      = 1.5 + Math.random() * 2.5;
+        a.stuckTimer = 0;
+      } else {
+        // Stuck detection: if actual speed is very low relative to desired speed
+        const moved       = Math.sqrt((a.lx - prevLx) ** 2 + (a.lz - prevLz) ** 2);
+        const actualRatio = (moved / (a.speed * dt + 0.0001));
+        if (actualRatio < STUCK_SPEED_RATIO) {
+          a.stuckTimer += dt;
+        } else {
+          a.stuckTimer = Math.max(0, a.stuckTimer - dt * 2);
+        }
+        // Enter waiting if stuck too long
+        if (a.stuckTimer > STUCK_TIMEOUT) {
+          a.state      = 'waiting';
+          a.timer      = WAIT_MIN + Math.random() * (WAIT_MAX - WAIT_MIN);
+          a.stuckTimer = 0;
+          a.vx         = 0;
+          a.vz         = 0;
+        }
       }
-      applySeparation(a, dt);
-      avoidFurniture(a, dt);
       a.ang = lerpAngle(a.ang, a.tAng, rs);
       a.legScale += (1.0 - a.legScale) * (1 - Math.exp(-6 * dt));
       a.grp.position.y = GROUND_Y + AGENT_BASE_Y + a.sitOff + Math.abs(Math.sin(a.phase)) * 0.015;
@@ -299,17 +306,20 @@ export function updateAgents(dt, t) {
       a.mesh.legL.rotation.x *= 0.92;
       a.mesh.legR.rotation.x *= 0.92;
       a.mesh.head.rotation.z  = Math.sin(t * 1.5 + a.phase) * 0.04;
-      applySeparation(a, dt);
+      // Light RVO separation even while paused (avoid overlap with passing agents)
+      const sep = computeRVO(a, 0, 0);
+      a.lx += sep.vx * dt * 0.5;
+      a.lz += sep.vz * dt * 0.5;
 
       if (a.timer <= 0) {
         if (Math.random() < a.wkChance) {
           const dk = findFreeDesk();
           if (dk) {
             dk.reservedBy = a;
-            a.desk = dk;
-            a.tx   = dk.seatWX - RP_X;
-            a.tz   = dk.seatWZ - RP_Z;
-            a.tAng = Math.atan2(a.tx - a.lx, a.tz - a.lz);
+            a.desk  = dk;
+            a.tx    = dk.seatWX - RP_X;
+            a.tz    = dk.seatWZ - RP_Z;
+            a.tAng  = Math.atan2(a.tx - a.lx, a.tz - a.lz);
             a.state = 'toDesk';
           } else {
             agentPickWander(a);
@@ -322,9 +332,26 @@ export function updateAgents(dt, t) {
       a.legScale += (1.0 - a.legScale) * (1 - Math.exp(-6 * dt));
       a.grp.position.y = GROUND_Y + AGENT_BASE_Y + a.sitOff;
 
+    } else if (a.state === 'waiting') {
+      // Brief freeze after being stuck — let the crowd clear
+      a.timer -= dt;
+      a.mesh.legL.rotation.x *= 0.88;
+      a.mesh.legR.rotation.x *= 0.88;
+      a.mesh.head.rotation.z  = Math.sin(t * 1.8 + a.phase) * 0.05; // look around
+      a.vx *= 0.7; // bleed off remaining velocity
+      a.vz *= 0.7;
+      a.grp.position.y = GROUND_Y + AGENT_BASE_Y + a.sitOff;
+      a.legScale += (1.0 - a.legScale) * (1 - Math.exp(-6 * dt));
+
+      if (a.timer <= 0) {
+        // Pick a fresh wander target — don't retry the stuck one
+        agentPickWander(a);
+      }
+      a.ang = lerpAngle(a.ang, a.tAng, rs * 0.4);
+
     } else if (a.state === 'toDesk') {
-      if (agentWalkTo(a, dt)) {
-        // snap to exact chair anchor
+      // Use RVO disabled for final desk approach (avoid furniture jitter near chair)
+      if (agentWalkTo(a, dt, false)) {
         if (a.desk) {
           a.lx   = a.desk.seatWX - RP_X;
           a.lz   = a.desk.seatWZ - RP_Z;
@@ -332,38 +359,31 @@ export function updateAgents(dt, t) {
         }
         a.state  = 'work';
         a.timer  = 5 + Math.random() * 8;
-        // hip rises to chair-seat height above floor
         a.sitTgt = CHAIR_SEAT_H - AGENT_BASE_Y;
         a.mesh.torso.rotation.x = 0;
+        a.vx = 0;
+        a.vz = 0;
       }
       a.ang = lerpAngle(a.ang, a.tAng, rs);
       a.grp.position.y = GROUND_Y + AGENT_BASE_Y + a.sitOff + Math.abs(Math.sin(a.phase)) * 0.015;
 
     } else if (a.state === 'work') {
       a.timer -= dt;
-
-      // smooth sit interpolation
       a.sitOff += (a.sitTgt - a.sitOff) * (1 - Math.exp(-5 * dt));
 
-      // legs: bend forward + scale down to avoid chair clipping
       const lT = 1 - Math.exp(-6 * dt);
       a.mesh.legL.rotation.x += (1.2 - a.mesh.legL.rotation.x) * lT;
       a.mesh.legR.rotation.x += (1.2 - a.mesh.legR.rotation.x) * lT;
       a.legScale += (0.5 - a.legScale) * lT;
       a.mesh.botCap.visible = false;
 
-      // typing head micro-motions
       a.mesh.head.rotation.x = Math.sin(t * 2.2 + a.phase) * 0.035;
       a.mesh.head.rotation.z = Math.sin(t * 0.8 + a.phase * 2) * 0.02;
-      // torso lean
       a.mesh.torso.rotation.x = 0.06 + Math.sin(t + a.phase) * 0.01;
-      // face monitor
       a.ang = lerpAngle(a.ang, a.tAng, rs * 0.5);
-      // breathing bob
       a.grp.position.y = GROUND_Y + AGENT_BASE_Y + a.sitOff + Math.sin(t * 1.2 + a.phase) * 0.002;
 
       if (a.timer <= 0) {
-        // stand up and wander
         if (a.desk) { a.desk.reservedBy = null; a.desk = null; }
         a.mesh.torso.rotation.x = 0;
         a.mesh.head.rotation.x  = 0;
@@ -372,19 +392,19 @@ export function updateAgents(dt, t) {
       }
     }
 
-    // ── Sit-offset lerp for non-work states (stand-up return) ──
+    // ── Sit-offset lerp for non-work states ──
     if (a.state !== 'work') {
       a.sitOff += (a.sitTgt - a.sitOff) * (1 - Math.exp(-5 * dt));
       if (Math.abs(a.sitOff) < 0.003) a.sitOff = 0;
     }
 
-    // ── Apply leg scale (hip-pivot: legs hang from y=0) ──
-    a.mesh.legL.scale.y  = a.legScale;
-    a.mesh.legR.scale.y  = a.legScale;
+    // ── Apply leg scale (hip-pivot) ──
+    a.mesh.legL.scale.y    = a.legScale;
+    a.mesh.legR.scale.y    = a.legScale;
     a.mesh.legL.position.y = 0;
     a.mesh.legR.position.y = 0;
 
-    // ── Apply world position + rotation ──
+    // ── World position + rotation ──
     a.grp.position.x = RP_X + a.lx;
     a.grp.position.z = RP_Z + a.lz;
     a.grp.rotation.y = a.ang;
