@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Isometric Ops</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{overflow:hidden;background:#1a1520;font-family:'Outfit',sans-serif}
+  canvas{display:block}
+  .hud{position:fixed;top:24px;left:28px;z-index:10;pointer-events:none}
+  .hud-t{font-size:10px;font-weight:500;letter-spacing:3px;text-transform:uppercase;color:#e8c4a0;opacity:0;animation:fi 1s ease .5s forwards}
+  .hud-s{font-size:10px;font-weight:300;letter-spacing:1.5px;color:rgba(255,255,255,.3);margin-top:4px;opacity:0;animation:fi 1s ease .8s forwards}
+  #cam-btn{position:fixed;top:24px;right:28px;z-index:20;background:rgba(10,10,10,.8);border:1px solid rgba(232,196,160,.2);color:rgba(255,255,255,.5);padding:8px 14px;border-radius:20px;cursor:pointer;font-family:'Outfit',sans-serif;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;backdrop-filter:blur(8px);transition:all .35s;opacity:0;animation:fi .8s ease 1.2s forwards}
+  #cam-btn:hover{border-color:rgba(232,196,160,.5);background:rgba(232,196,160,.1)}
+  #cam-btn.on{color:#e8c4a0;border-color:rgba(255,255,255,.3)}
+  #cam-hint{position:fixed;top:58px;right:28px;z-index:19;background:rgba(10,10,10,.85);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:9px 13px;font-size:9px;font-weight:300;letter-spacing:.5px;color:rgba(255,255,255,.3);line-height:1.9;backdrop-filter:blur(8px);opacity:0;transform:translateY(-6px);transition:all .5s cubic-bezier(.22,1,.36,1);pointer-events:none}
+  #cam-hint.on{opacity:1;transform:translateY(0)}
+  #cam-hint b{color:#e8c4a0;font-weight:400}
+  .info{position:fixed;bottom:24px;left:28px;z-index:10;pointer-events:none;display:flex;gap:20px}
+  .inf{opacity:0;animation:fi .8s ease forwards}
+  .inf:nth-child(1){animation-delay:1s}.inf:nth-child(2){animation-delay:1.15s}.inf:nth-child(3){animation-delay:1.3s}
+  .inf b{font-size:11px;font-weight:500;color:rgba(255,255,255,.5);display:block}
+  .inf span{font-size:9px;font-weight:300;color:rgba(255,255,255,.3);letter-spacing:1.5px;text-transform:uppercase}
+  @keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  #err{position:fixed;bottom:80px;left:28px;right:28px;z-index:50;color:#ff6b6b;font-size:11px;font-family:monospace;background:rgba(0,0,0,.8);padding:12px;border-radius:8px;display:none;max-height:120px;overflow:auto;white-space:pre-wrap}
+  #ld{position:fixed;inset:0;z-index:100;background:#1a1520;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity .8s}
+  #ld.ok{opacity:0;pointer-events:none}
+  .sp{width:32px;height:32px;border:1.5px solid rgba(255,255,255,.06);border-top-color:#e8c4a0;border-radius:50%;animation:rot 1s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<div id="ld"><div class="sp"></div></div>
+<div class="hud">
+  <div class="hud-t">Isometric Ops</div>
+  <div class="hud-s">Orbital Physics · v4.0</div>
+</div>
+<button id="cam-btn">Top View (T)</button>
+<div id="cam-hint"><b>Drag</b> orbit · <b>Scroll</b> zoom · <b>WASD</b> rotate · <b>Q/E</b> zoom · <b>T</b> player</div>
+<div class="info">
+  <div class="inf"><b>Click floor</b><span>Move manager</span></div>
+  <div class="inf"><b>3 workers</b><span>Autonomous</span></div>
+  <div class="inf"><b>T key</b><span>Top view</span></div>
+</div>
+<div id="err"></div>
+
+<!-- THREE.js must load as a plain script (global) BEFORE modules import from it -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<!-- Inline error reporter: catches module-parse errors that onerror misses -->
+<script>
+  function showErr(msg) {
+    var el = document.getElementById('err');
+    el.style.display = 'block';
+    el.textContent  += msg + '\n';
+  }
+  window.onerror = function(m, s, l, c, e) { showErr('L' + l + ': ' + m); };
+  window.addEventListener('unhandledrejection', function(ev) {
+    showErr('Module error: ' + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason));
+  });
+</script>
+
+<!-- ES module entry point — THREE is already a global by this point -->
+<script type="module" src="src/main.js"></script>
+
+</body>
+</html>
